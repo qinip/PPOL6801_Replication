@@ -1,0 +1,729 @@
+---
+title: "Replication Code: Benoit et al.(2019) Measureing and Explaining Political Sophistication through Textual Complexity"
+author: "Zhiqiang Ji"
+format: 
+  html:
+    code-fold: true
+    toc: true
+    toc-depth: 3
+    toc-float:
+      collapsed: false
+      smooth-scroll: true
+    self-contained: true
+execute:
+  warning: false
+  error: true
+editor_options: 
+  chunk_output_type: console
+---
+
+## 1. Introduction
+
+This Quarto notebook is the replication code for Benoit et al.(2019). This study used crowdsourcing to perform thousands of pairwise comparisons of text snippets excerpted from the State of the Union addresses and incorporate these results into a statistical model of sophistication. The official publication can be found online at AJPS, [DOI: 10.1111/ajps.12423](https://doi.org/10.1111/ajps.12423). The authors have generously provided all materials necessary for replicating the analyses presented in their article. These materials are hosted on the *American Journal of Political Science* Dataverse within the Harvard Dataverse Network at: [DOI: 10.7910/DVN/9SF3TI](https://doi.org/10.7910/DVN/9SF3TI).
+
+This replication cannot repeat the crowdsourced coding of the original text data, hence omitting the data collection process. The related code files related to the data preparation for crowdsourcing jobs include: `01a_generate_CF_input_921916.R`, `01b_generate_CF_input_952737.R`, `01c_generate_CF_input_999866.R`, and `02_execute_CF_runs_and_download_data`, which can be found among the Dataverse materials. This replication code will start with the data downloaded from the Dataverse, then proceed to model development and results presentation.
+
+### Structure of the Replication
+
+The original study's workflow of developing a new model of textual sophistication involves the following steps:
+
+1. Get human judgments of relative textual easiness for political texts.
+2. Fit an unstructured Bradley-Terry model for pairwise comparisons to the judgment data from Step 1 and estimate a measure of latent "easiness" for each text.
+3. Using the random forest algorithm, estimate the best predictors of the textual easiness from Step 2 among a set of potential determinants of textual sophistication.
+4. Using the most highly predictive covariates from Step 3, fit a structured Bradley-Terry model to the judgment data from Step 1 and estimate a measure of latent sophistication for each text, then compare with other measurements.
+5. Use the fitted model from Step 4 to "predict" the easiness parameter for a given new text, including:
+    - Using the comparative formulation to estimate the relative probability that one new text is easier than another text, or a baseline text;
+    - Using nonparametric bootstrapping of the new texts to represent uncertainty in the predicted point estimates.
+    
+The following sections will replicate these steps in order. Section 2 will replicate Steps 2-4, and Section 3 will replicate Step 5.
+
+## 2. Fitting a Newe Model of Textual Sophistication
+
+### 2.1 Set up the environment
+
+```{r setup, include=FALSE}
+## Install and load necessary packages
+library(reticulate)
+# reticulate::conda_create("ppol6801")
+use_condaenv("ppol6801", conda = "C:/Users/j_i/anaconda3/condabin/conda.bat", required = TRUE)
+reticulate::use_condaenv("ppol6801")
+# Sys.setenv(RETICULATE_PYTHON ="/Users/zhiqiangji/anaconda3/envs/ppol6801/bin/python")
+# Sys.setenv(SPACY_PYTHON = "/Users/zhiqiangji/anaconda3/envs/ppol6801")
+# install.packages("BradleyTerry2")
+# devtools::install_github("quanteda/quanteda")  
+# devtools::install_github("quanteda/quanteda.corpora") 
+# install.packages(c("spacyr", "randomForest", "apsrtable"))
+# devtools::install_github("quanteda/spacyr", build_vignettes = FALSE)
+library("spacyr")
+spacy_install()
+spacy_initialize()
+# devtools::install_github("kbenoit/sophistication")
+# install.packages("/Users/zhiqiangji/Library/CloudStorage/OneDrive-Personal/EDX/GU_2024_Spring/6801/replication/repo/data/apsrtable_0.8-8.tar.gz", 	repos = NULL, type = "source")
+library("sophistication")
+library("tidyverse")
+library("randomForest")
+library("quanteda")
+library("quanteda.corpora")
+library("quanteda.textmodels")
+library("quanteda.textstats")
+library("apsrtable")
+library("stargazer")
+library("BradleyTerry2")
+library("ggplot2")
+```
+
+### 2.2 Generate sentence covariates
+
+The first step in the replication is to generate the covariates for the sentences. The original study used the `spacyr` package to generate covariates for the sentences. The following code will replicate the covariate generation process for the last two jobs in the original study. The covariates include readability measures, baseline covariates, and part-of-speech (POS) covariates. The covariates are then saved in two files. One is a normal data frame while the other is in the ‘chameleons’ format for later use with the `BradleyTerry2` R package.
+
+```{r}
+# Read in the comparison data
+getwd()
+allsentences <-
+    rbind(read.csv("data/CF_output_f999866.csv", stringsAsFactors = FALSE),
+          read.csv("data/CF_output_f952737.csv", stringsAsFactors = FALSE))
+# 27807 obs. of  25 variables
+
+# create chameleons format data
+job999866covars_chameleons <-
+    bt_input_make(allsentences, covars = TRUE,
+                  readability_measure = c("Flesch",
+                                          "Dale.Chall",
+                                          "FOG",
+                                          "SMOG",
+                                          "Spache",
+                                          "Coleman.Liau"),
+                  covars_baseline = TRUE, covars_pos = TRUE, normalize = TRUE)
+
+save(job999866covars_chameleons, file = "data/my_job999866covars_chameleons.rda")
+
+
+## Save the same data, as a data.frame
+
+# select just the text and their IDs
+allsentences <- allsentences[, c("snippetid1", "text1", "snippetid2", "text2")]
+# wrap the sentences
+allsentences <- data.frame(snippetid = c(allsentences[, "snippetid1"],
+                                         allsentences[, "snippetid2"]),
+                           text = c(allsentences[, "text1"],
+                                    allsentences[, "text2"]),
+                           stringsAsFactors = FALSE)
+# just keep the unique ones
+allsentences <- allsentences[!duplicated(allsentences$snippetid), ]
+nrow(allsentences) # 3322 rows
+
+# create the basic covariates
+allsentences_covars <- cbind(
+    allsentences,
+    covars_make(allsentences$text, readability_measure = "Flesch"),
+    covars_make_baselines(allsentences$text)
+)
+
+txt <- allsentences$text
+names(txt) <- allsentences$snippetid
+
+# add the POS covariates
+allsentences_pos <- covars_make_pos(txt)
+
+job999866covars <-
+    merge(allsentences_covars, allsentences_pos, by.x = "snippetid", by.y = "doc_id")
+save(job999866covars, file = "data/my_job999866covars.rda")
+
+## Check the covariates
+print(names(job999866covars))
+```
+
+**Note**: Please refer to the codebook.pdf file under the `data` folder for the description of the covariates. 
+
+### 2.3 Make unstructured brTandF abilities
+
+The next step is to fit an unstructured Bradley-Terry model to the judgment data. The following code will fit the unstructured model with and without bias reduction. The model will be used to predict the easiness for a given new text. 
+
+The authors of the original study fitted the model with and without bias reduction. The model with bias reduction is used to predict the easiness of the new texts. The model without bias reduction is used to predict the easiness of the new texts and compare the results with the model with bias reduction. The choice between these two choices turned out to be unimportant for the selection of important predictors in the next step.
+
+**Note**: Fitting the unstructured B-T models takes about 4-6 hours depending on machine speed.
+
+```{r}
+load("data/my_job999866covars_chameleons.rda")
+dat <- job999866covars_chameleons 
+## Check the data
+summary(dat)
+str(dat) ## 2469 docs, 19430 comparisons
+
+
+## Fit the unstructured B-T models
+## With bias reduction 
+
+# fit unstructured model (br=T)
+BT_unstruc_brT <-
+    BTm(player1 = easier, player2 = harder, br = TRUE, id = "ID", data = dat)
+save(BT_unstruc_brT, file = "data/my_BT_unstructured_brT_abilities.rda")
+
+
+## No bias reduction
+
+# fit unstructured model (br=F)
+BT_unstruc_brF <-
+    BTm(player1 = easier, player2 = harder, br = FALSE, id = "ID", data = dat)
+save(BT_unstruc_brF, file ="data/my_BT_unstructured_brF_abilities.rda")
+```
+
+### 2.4 RandomForest variable selection
+
+This step will use both B-T models with or without bias reduction to fit RF selection of the most important predictors.
+
+```{r}
+## Fit the Random Forest using the B-T model WITH bias reduction 
+set.seed(42)
+load("data/my_BT_unstructured_brT_abilities.rda")
+BT1 <- BT_unstruc_brT
+
+# locate the relevant predictors in the predictors part of the data
+y <- BTabilities(BT1)[, "ability"]
+yy <- y[!is.na(y)] #remove NAs
+m <- match(names(yy), rownames(dat$predictors))
+
+# collect the possible terms -- note that we remove Flesch (because it's aliased by the other variables)
+terms <- c("W3Sy", "W2Sy", "W_1Sy", "W6C", "W7C", "W_wl.Dale.Chall", "Wlt3Sy", 
+           "meanSentenceLength", "meanWordSyllables", "meanWordChars", 
+           "meanSentenceChars", "meanSentenceSyllables", "brown_mean", "brown_min", 
+           "google_mean_2000", "google_min_2000", "pr_noun", "pr_verb", "pr_adjective", 
+           "pr_adverb", "pr_clause", "pr_sentence")
+
+
+X <- dat$predictors[m, terms]
+
+# fit the RF model
+mod <- randomForest(X, y = yy, ntree = 1000)
+mod_bias_reduced<-mod
+save(x = mod_bias_reduced, file = "data/my_rf_model_bias_reduced.rda")
+
+
+## Fit RF with NO bias reduction 
+set.seed(42)
+load("data/my_BT_unstructured_brF_abilities.rda")
+BT2 <-  BT_unstruc_brF
+
+# locate the relevant predictors in the predictors part of the data
+y2 <- BTabilities(BT2)[, "ability"]
+yy2 <- y2[!is.na(y2)] #remove NAs
+mm <- match(names(yy2), rownames(dat$predictors))
+
+X2 <- dat$predictors[mm, terms]
+
+# use randomForest instead of VSURF
+mod2 <- randomForest(X2, y = yy2, ntree = 1000)
+mod_non_bias_reduced<-mod2
+save(x = mod_non_bias_reduced, file = "data/my_rf_model_non_bias_reduced.rda")
+
+# Plot the predictors' importance
+# prevent the variable names from overlapping
+par(mfrow=c(2,1), mar=c(4,4,2,1))
+varImpPlot(mod_bias_reduced, main = "Bias Reduced", pch = 16)
+varImpPlot(mod_non_bias_reduced, main = "Not Bias Reduced", pch = 16)
+dev.copy2pdf(file = "figures/figureS1.pdf", 
+             width = 11, height = 9)
+dev.off()
+```
+
+The results of the RF predictor selections are shown in Figure S1. Both unstructured B-T models with and without bias reduction show that the most important predictors are the same. The replication of this step confirms the significance of two new kinds of measures the authors introduced to the measurements of sophistication: `google_min_2000` for word rarity, and `pr_noun` for content complexity.
+
+
+### 2.5 Additional covariates for the requested texts
+
+This step gets the covariate information for the average covariate values of paragraphs that span the entirety of each SOTU address under study. 
+
+```{r}
+## Make additional covariates for the requested texts
+
+# SOTU addresses
+data(data_corpus_sotu, package = "quanteda.corpora")
+
+x1 <- covars_make(data_corpus_sotu)
+x2 <- covars_make_pos(data_corpus_sotu)
+x3 <- covars_make_baselines(data_corpus_sotu,
+                            baseline_year = lubridate::year(docvars(data_corpus_sotu, "Date")))
+
+sotu_covars <- cbind(x1, x2, x3)
+save(sotu_covars, file = "data/my_sotu_covars.rda")
+```
+
+### 2.6 Fit the "Best Models" and Evaluate Results
+
+Now, we will fit four models: the "basic Flesch", the "optimal Flesch", the "basic RF" and the "best" structured B-T models. The latter two are using the top covariates selected in the RF step. The "basic RF" model is the one that includes the covariates `google_min_2000`, `meanSentenceChars`, and `pr_noun`; and the "Best" includes an additional `meanWordChars`. We will also evaluate the results of the model.
+
+**Note**: Each of these models takes about 60 seconds to fit. Thus, bootstrapping the proportion of contests correctly predicted (PCP) is very expensive. This replication took about 30 hours to finish the bootstrapping process.
+
+```{r}
+## Fit structured BT models ============
+# baseline Flesch model
+BT_basic_Flesch <- BTm(player1 = easier, player2 = harder,
+                       formula = ~ Flesch[ID], id = "ID",
+                       data = job999866covars_chameleons)
+
+# optimal Flesch model
+BT_optimal_Flesch <- BTm(player1 = easier, player2 = harder,
+                         formula = ~ meanSentenceLength[ID] + meanWordSyllables[ID],
+                         id = "ID", data = job999866covars_chameleons)
+
+# basic RF model
+BT_basic_RF <- BTm(player1 = easier, player2 = harder,
+                   formula = ~ google_min_2000[ID] + meanSentenceChars[ID] + pr_noun[ID],
+                   id ="ID", data = job999866covars_chameleons)
+
+# best model
+BT_best <- BTm(player1 = easier, player2 = harder,
+               formula = ~ google_min_2000[ID] +  meanSentenceChars[ID] + pr_noun[ID] + meanWordChars[ID],
+               id = "ID", data = job999866covars_chameleons)
+
+# save the results
+model_results <- list(BT_basic_Flesch = BT_basic_Flesch,
+                      BT_basic_RF = BT_basic_RF,
+                      BT_optimal_Flesch = BT_optimal_Flesch,
+                      BT_best = BT_best)
+
+#save(model_results, file = "data/my_Best_Model_Results_list.rda")
+load("data/my_Best_Model_Results_list.rda")
+model_results <- model_results
+
+#save(BT_best, file = "data/my_BT_best.rda")
+load("data/my_BT_best.rda")
+BT_best <- BT_best
+
+## OUTPUT FOR TABLE 2 ================
+
+# function for fit (percent corr predicted)
+prop.correct <- function(x = BTFRE) { 
+    sum(predict(x, type = "response") > .5) / length(predict(x, type = "response"))
+}
+
+# with(model_results, apsrtable(BT_basic_Flesch, BT_optimal_Flesch, BT_basic_RF, BT_best))
+
+# order the models in descending order of PCP
+model_results <- model_results[names(sort(sapply(model_results, prop.correct), decreasing = TRUE))]
+
+# output models in terms of PCP
+table2 <- paste("\nBottom row of TABLE 2\n -----------------------------------------\n",
+                sprintf("%-20s ", "Model"), "     PCP      AIC\n",
+                "========================  =====  ========\n") 
+for (m in seq_along(model_results)) {
+    table2 <- paste(table2, 
+                    sprintf("%-25s", names(model_results)[m]),
+                    sprintf("%2.3f", prop.correct(model_results[[m]]) / .79),  # <- .79 is the upperbound of the PCP
+                    sprintf(" %5.2f", model_results[[m]][["aic"]]), 
+                    "\n")
+}
+table2 <- paste0(table2, " -----------------------------------------\n\n")
+cat(table2)
+
+
+## Original code note: 
+# Bottom row of TABLE 2
+# Model                      PCP      AIC
+# BT_basic_Flesch           0.719  26267.79 
+# BT_basic_RF               0.737  25915.01 
+# BT_optimal_Flesch         0.738  25910.29 
+# BT_best                   0.741  25740.25 
+```
+
+The replicated results are slightly different from the original study's evaluation of PCP and AIC. The differences are likely due to the random seed used in the replication. The replication results are consistent with the original study's findings, showing that the "best" model has the highest PCP and the lowest AIC. 
+
+**Note 1: Upper bound of PCP**
+
+It should be noted that the PCP is adjusted by dividing by 0.79, which is the upper bound of the PCP. This adjustment is necessary because the PCP is not a true probability, but a measure of the proportion of contests correctly predicted. Due to the nature of the crowdsourced coding job, the judgment may have discrepancies for the same pair of snippets if they are judged multiple times, hence there is a upper bound for model performance. For example, if one pair of snippets have been judged by 3 coders and only two of them had the same judgment, the best PCP a model can get is 2/3. 
+
+More detailed discussion about the upper bound of PCP can be found in the original study's Supporting Information, Section D "Assessing model performance". Also, the code to produce this upper bound of 0.79 can be found in the original study's code file `11_supplemental_analysis.R`. This replication will not repeat the code here.
+
+
+**Note 2: Possible typo in the paper**
+
+The order of the models in the original paper's Table 2 (p.501) is different from the order of the models in the code. In the paper the "basic_RF" model has a PCP of 0.738 while the "optimal_Flesch" model has a PCP of 0.737. However, in the code, according to the original code note as well as the replication results, the "optimal_Flesch" model has a slightly higher PCP than the "basic_RF" one by 0.001. The AIC values in the original code note are consistent with the paper. 
+
+
+```{r}
+## Bootstrap Confidence Intervals for PCP
+
+# we want to bootstrap the results of a BT model
+# to do that, we can use the internal subset= argument
+# Except that, in each case, the subset is a sample of all the rows
+
+# function for fit (percent corr predicted)
+prop.correct <- function(x = BTFRE) { 
+    sum(predict(x, type = "response") > .5) / length(predict(x, type = "response"))
+}
+
+# Basic function to do a subset bootstrap
+# It returns an accuracy estimate adjusted as it should be
+boot.one.time <- function(d = job999866covars_chameleons, refmodel) {
+    samp <<- sample(1:nrow(d$easier), nrow(d$easier), replace = TRUE)
+    model.call <<- as.formula(refmodel)
+    BT_resamp <<- BTm(player1 = easier, player2 = harder, formula = model.call, 
+                      id = "ID", data = job999866covars_chameleons, subset = samp)
+    adj.acc <<- prop.correct(BT_resamp) / 0.79
+    adj.acc
+}
+
+attach(model_results)
+n <- 500 # number of samples
+
+# baseline Flesch model bootstrap
+# Fit this to the BT_basic_Flesch model, 2 times
+bs.draws_basic <- replicate(n, boot.one.time(d=job999866covars_chameleons, refmodel = BT_basic_Flesch))
+
+# basic RF model
+bs.draws_basicRF <- replicate(n, boot.one.time(d=job999866covars_chameleons, refmodel = BT_basic_RF))
+
+# optimal Flesch model
+bs.draws_opt <- replicate(n, boot.one.time(d=job999866covars_chameleons, refmodel = BT_optimal_Flesch))
+
+# best model
+bs.draws_best <- replicate(n, boot.one.time(d=job999866covars_chameleons, refmodel = BT_best))
+
+BS_results <- data.frame(bs.draws_basic, bs.draws_basicRF, bs.draws_opt, bs.draws_best)
+detach(model_results)
+save(BS_results, file = "data/bootstrap_results_AJPSR2.rda")
+load("data/bootstrap_results_AJPSR2.rda")
+BS_results <- BS_results
+```
+
+### 2.7 Compare the Performance
+
+```{r, results = 'asis'}
+## Replicate Table 2 to compare the performance of the models
+
+# Create a empty dataframe to store the results
+coefficients_table <- data.frame()
+
+# Extract the coefficients from each model
+for(m in names(model_results)) {
+  model_coef_summary <- summary(model_results[[m]])$coefficients
+  aic_score <- model_results[[m]][["aic"]]
+  model_df <- data.frame(
+    Coefficient = rownames(model_coef_summary),
+    Estimate = model_coef_summary[, "Estimate"],
+    StdError = model_coef_summary[, "Std. Error"],
+    Model = m
+  )
+  coefficients_table <- rbind(coefficients_table, model_df)
+}
+
+coefficients_table <- coefficients_table %>%
+  mutate(Estimate_and_StdError = paste0(round(Estimate, 3), " (", round(StdError, 3), ")")) %>%
+  select(-Estimate, -StdError)
+
+coefficients_table_wide <- coefficients_table %>%
+  spread(key = Model, value = Estimate_and_StdError)
+
+## Add AIC scores to the table
+aic_scores <- sapply(model_results, function(m)round( m[["aic"]],2))
+aic_df_wide <- data.frame(Coefficient = "AIC", t(data.frame(aic_scores))) 
+row.names(aic_df_wide) <- NULL
+coefficients_table_wide  <- rbind(coefficients_table_wide , aic_df_wide)
+
+## Add PCP to the table
+PCP_scores <- sapply(BS_results, function(y) round(mean(y), 3))
+PCP_df_wide <- data.frame(Coefficient = "PCP", t(data.frame(PCP_scores)))
+row.names(PCP_df_wide) <- NULL
+# Change column names
+colnames(PCP_df_wide) <- c("Coefficient", "BT_basic_Flesch", "BT_basic_RF", "BT_optimal_Flesch", "BT_best")
+coefficients_table_wide  <- rbind(coefficients_table_wide , PCP_df_wide)
+
+
+## Add the CI to the table
+CI <- sapply(BS_results, function(y) round(quantile(y, c(0.025, .975)), 3))
+CI_df <- as.data.frame(CI)
+CI_row <- apply(CI_df, 2, function(x) paste0("[", x[1], ", ", x[2], "]"))
+CI_df_row <- data.frame(Coefficient = "[95% CI]", t(CI_row))
+colnames(CI_df_row) <- c("Coefficient", "BT_basic_Flesch", "BT_basic_RF", "BT_optimal_Flesch", "BT_best")
+coefficients_table_wide <- rbind(coefficients_table_wide, CI_df_row)
+
+ordered_columns <- c("Coefficient", "BT_basic_Flesch", "BT_optimal_Flesch", "BT_basic_RF", "BT_best")
+coefficients_table_ordered <- coefficients_table_wide %>%
+  select(all_of(ordered_columns))
+
+stargazer(coefficients_table_ordered, type = "html", 
+          title = "Coefficients and Performance of the Four Structured Models",
+          summary = FALSE)
+
+```
+
+The replication of the "Table 2" of the paper confirms the original results, despite the trivial differences in numbers. The coefficients of the four models are consistent with the original results. The performance of the four models is also consistent with the original results. The 95% confidence intervals of the PCP scores are consistent with the original results.  
+
+## 3. Apply the Models to the Texts
+
+### 3.1 Compare snippets (Generate Table_3)
+
+For this section, I retained the original in-code notes on the results to facilitate comparison with the outcomes of my models.
+
+```{r}
+# I added two pieces of texts from the speeches of Obama and Trump
+
+txt_clinton <- "If we do these things-end social promotion; turn around failing schools; build modern ones; support qualified teachers; promote innovation, competition and discipline-then we will begin to meet our generation's historic responsibility to create 21st century schools.  Now, we also have to do more to support the millions of parents who give their all every day at home and at work."
+
+txt_bush <- "And the victory of freedom in Iraq will strengthen a new ally in the war on  terror, inspire democratic reformers from Damascus to Tehran, bring more hope  and progress to a troubled region, and thereby lift a terrible threat from the  lives of our children and grandchildren.  We will succeed because the Iraqi  people value their own liberty---as they showed the world last Sunday."
+
+txt_obama <- "Some schools redesign courses to help students finish more quickly.  Some use better technology.  The point is, it’s possible.  So let me put colleges and universities on notice:  If you can’t stop tuition from going up, the funding you get from taxpayers will go down.Higher education can’t be a luxury -– it is an economic imperative that every family in America should be able to afford."
+
+txt_trump <- "This is a moral issue.  The lawless state of our southern border is a threat to the safety, security, and financial wellbeing of all America.  We have a moral duty to create an immigration system that protects the lives and jobs of our citizens.  This includes our obligation to the millions of immigrants living here today who followed the rules and respected our laws."
+
+corp_example <- corpus(c(Clinton_1999 = txt_clinton, Bush_2005 = txt_bush, Obama_2012 = txt_obama, Trump_2019 = txt_trump))
+
+example_covs <- covars_make_all(corp_example)
+
+
+# TABLE 3 OUTPUT ---------
+# Check the key covariates for each snippet
+tab2 <- as.data.frame(sophistication:::get_covars_from_newdata.corpus(corp_example))
+row.names(tab2) <- tab2[, "_docid"]
+tab2 <- tab2[, c("google_min", "meanSentenceChars", "pr_noun", "meanWordChars")]
+tab2 <- t(tab2)
+tab2[1, , drop = FALSE]
+round(tab2[2:4, ], 2)
+
+#                   Clinton_1999 Bush_2005
+# meanSentenceChars       155.50    153.50
+# pr_noun                   0.30      0.23
+# meanWordChars             4.94      4.72
+```
+
+
+```{r}
+# ---- lambdas computed with precision
+load("data/my_BT_best.rda")
+(prd <- predict_readability(BT_best, corp_example))
+prd
+#                 lambda      prob   scaled
+# Clinton_1999 -3.250914 0.2545336 36.38281
+# Bush_2005    -3.528247 0.2055582 19.96412
+
+# verify lambdas
+coef(BT_best) %*% tab2
+```
+
+```{r}
+# ---- REPORTED LAMBDAS FROM TABLE 3
+tab2rounded <- round(tab2, 2)
+tab2rounded[1, 1] <- round(tab2[1, 1], 6)
+tab2rounded[1, 2] <- round(tab2[1, 2], 10)
+tab2lambdas <- round(round(coef(BT_best), 2) %*% tab2rounded, 2)
+tab2lambdas
+#      Clinton_1999 Bush_2005
+# [1,]        -2.64     -2.93
+```
+
+The replication results fit the results of the `Table 3` of the original paper.
+
+```{r}
+# ---- Pr(Clinton snippet easier than Bush snippet) from TEXT
+exp(tab2lambdas[1, "Clinton_1999"]) / 
+    (exp(tab2lambdas[1, "Clinton_1999"]) + exp(tab2lambdas[1, "Bush_2005"]))
+
+exp(tab2lambdas[1, "Obama_2012"]) / 
+    (exp(tab2lambdas[1, "Obama_2012"]) + exp(tab2lambdas[1, "Trump_2019"]))
+# Clinton_1999 
+#    0.5719961 
+```
+
+```{r}
+## lambdas v. fifth-grade texts in text of 5.2
+lamba5thgrade <- 
+    predict_readability(BT_best, newdata = corpus_group(data_corpus_fifthgrade, groups = rep(1, ndoc(data_corpus_fifthgrade))))[, "lambda"]
+lamba5thgrade
+# redo with correct reference
+predict_readability(BT_best, reference_top = lamba5thgrade,
+                    newdata = corpus_group(data_corpus_fifthgrade, groups = rep(1, ndoc(data_corpus_fifthgrade))))
+#      lambda prob scaled
+# 1 -2.193864  0.5    100
+
+# clinton and bush
+predict_readability(BT_best, reference_top = lamba5thgrade, newdata = corp_example)
+#                 lambda      prob   scaled
+# Clinton_1999 -3.250914 0.2578736 36.76429
+# Bush_2005    -3.528247 0.2084353 20.17345
+```
+
+It is surprising to see how the scaled score of Obama_2012 snippet (a paragraph on education) is slightly easier to read than the fifth grade level, which resonates well with the author's account on the limit of this sophistication measure that "great academic writers might be able to describe extremely complicated ideas in straightforward ways for popular audiences."
+
+### 3.2 Reanalyzing the State of the Union Addresses
+
+In this last section, we will replicate three figures from the original paper related to its reanalysis of the SOTU texts:
+
+1. In Figure 1, researchers rescaled their readability estimates to align with the 0-100 scale of the Flesch Reading Ease formula, providing a scatterplot that shows a strong positive correlation between their measure and the FRE scores, particularly within the theoretical 0-100 range of the Flesch scale.
+2. Figure 2 shows the readability of State of the Union addresses over time, indicating a slight increase in simplicity; the model also suggests that older speeches were harder and more recent ones easier to understand than traditional measures like the Flesch Reading Ease would indicate.
+3. Figure 3 illustrates the likelihood that spoken State of the Union (SOTU) addresses are easier to understand than their written counterparts by comparing the complexity of the two formats during the years when presidents delivered both a spoken and a written address on the same day about the same topics, revealing a probability between 0.54 and 0.64 that the spoken versions were easier.
+
+The authors have provide very detailed implementation of the following examples. I did not have much room to change the code. 
+
+**Note**: Annotating the SOTU paragraphs here can take between 30-40 minutes.
+
+```{r}
+# convert to paragraphs and tidy up
+data_corpus_sotuparagraphs <- corpus_reshape(data_corpus_sotu, to = "paragraphs")
+toremove <- rep(FALSE, ndoc(data_corpus_sotuparagraphs))
+
+# remove paragraphs with all caps titles
+toremove <- toremove |
+    grepl("^([A-Z0-9[:punct:]]+\\s{0,1})+\\.{0,1}$", corpus_group(data_corpus_sotuparagraphs))
+# remove paragraphs with long figures (from a table)
+toremove <- toremove |
+     grepl("(\\d{1,3}(,\\d{3}){1,}(\\.\\d{2})*(\\s\\-\\s)+)", corpus_group(data_corpus_sotuparagraphs))
+# remove any snippets with long ....
+toremove <- toremove |
+    grepl("\\.{4,}", corpus_group(data_corpus_sotuparagraphs))
+# remove any snippets with ----- (indicates a table)
+toremove <- toremove |
+     grepl("\\-{4,}", corpus_group(data_corpus_sotuparagraphs))
+# remove e.g. "(a) For veterans."
+toremove <- toremove |
+   (grepl("^\\([a-zA-Z0-9]+\\)\\s+.*\\.$",  corpus_group(data_corpus_sotuparagraphs)) &
+         ntoken(data_corpus_sotuparagraphs) <= 30)
+data_corpus_sotuparagraphs <- corpus_subset(data_corpus_sotuparagraphs, !toremove)
+
+
+# summary statistics
+summary(summary(data_corpus_sotuparagraphs, n = ndoc(data_corpus_sotuparagraphs)))
+
+# add readability stats
+docvars(data_corpus_sotuparagraphs, "Flesch") <-
+   textstat_readability(data_corpus_sotuparagraphs, "Flesch")[["Flesch"]]
+
+set.seed(42)
+
+# add predicted BMS "static"
+rdblty_2000 <- predict_readability(BT_best, data_corpus_sotuparagraphs,
+                                 baseline_year = 2000, bootstrap_n = 100)
+names(rdblty_2000) <- paste(names(rdblty_2000), "2000", sep = "_")
+# add predicted BMS "dynamic"
+rdblty_local <- predict_readability(BT_best, data_corpus_sotuparagraphs,
+                                    baseline_year = lubridate::year(docvars(data_corpus_sotuparagraphs, "Date")),
+                                    bootstrap_n = 100)
+names(rdblty_local) <- paste(names(rdblty_local), "local", sep = "_")
+
+docvars(data_corpus_sotuparagraphs) <-
+    cbind(docvars(data_corpus_sotuparagraphs), rdblty_2000, rdblty_local)
+
+save(data_corpus_sotuparagraphs, file = "data/my_data_corpus_sotuparagraphs.rda")
+
+## Generate Figures 1-3
+
+# create a subfolder for figures
+dir.create("figures", showWarnings = FALSE)
+
+## FIGURE 1 --------  
+
+# get FRE scores for the snippets
+FRE <- dat$predictors$Flesch
+names(FRE) <- rownames(dat$predictors)
+
+load("data/my_BT_best.rda")
+# get lambdas from BMS best fitting model
+main_lambdas <- BTabilities(BT_best)[,"ability"]
+
+# rescale lambdas to the 0-100 space correctly
+rescaled_lambdas <- 226.06927 + 57.93899 * main_lambdas
+# check that they are matched up
+m <- match(names(FRE), names(rescaled_lambdas)) ## they are matched up
+
+ggplot(data.frame(FRE = FRE, rslambda = rescaled_lambdas), aes(x = FRE, y = rslambda)) +
+    geom_point(size = .6) +
+    labs(y = "Rescaled Best BT Model") +
+    geom_smooth(method = "lm", se = TRUE) +
+    geom_hline(yintercept = c(0, 100), linetype = "dashed", color = "firebrick") +
+    theme(axis.text.x = element_text(size = 5),
+          axis.text.y = element_text(size = 5)) +
+    theme_classic()
+dev.copy2pdf(file = "figures/my_figure1.pdf", height = 4.5, width = 7) 
+dev.off()
+
+
+## FIGURE 2 --------  
+# can take 10-15 minutes to run since it has to tag all of the text
+load("data/my_data_corpus_sotuparagraphs.rda")
+
+data_corpus_sotuclean <- data_corpus_sotuparagraphs %>%
+    corpus_reshape(to = "documents") %>%
+    corpus_subset(!grepl("(1945|1956|1972|1978|1979|1980)b", docnames(.))) 
+docvars(data_corpus_sotuclean, "year") <- lubridate::year(docvars(data_corpus_sotuclean, "Date"))
+load("data/my_BT_best.rda")
+set.seed(42)
+lamba5thgrade <- 
+    predict_readability(BT_best, newdata = corpus_group(data_corpus_fifthgrade, groups = rep(1, ndoc(data_corpus_fifthgrade))))[, "lambda"]
+predrd <- predict_readability(BT_best, newdata = data_corpus_sotuclean, 
+                              reference_top = lamba5thgrade,
+                              baseline_year = docvars(data_corpus_sotuclean, "year"), 
+                              bootstrap_n = 100)
+# add the results to the corpus docvars
+docvars(data_corpus_sotuclean, names(predrd)) <- predrd
+
+# compute FRE ratio to 5th grade texts
+docvars(data_corpus_sotuclean, "FREv5thgrade") <- 
+    0.5 * 
+    textstat_readability(data_corpus_sotuclean, "Flesch")[["Flesch"]] /
+    textstat_readability(corpus_group(data_corpus_fifthgrade, 
+                               groups = rep(1, ndoc(data_corpus_fifthgrade))), "Flesch")[["Flesch"]]
+
+ggplot(data = docvars(data_corpus_sotuclean)) +
+    xlab("") +
+    ylab("Probability that SOTU is Easier than a 5th Grade Text") +
+    geom_point(aes(x = year, y = prob), size = 1.5, color = "black", shape = 16) +
+    geom_errorbar(aes(ymin = prob_lo, ymax = prob_hi, x = year), width = 0.25) +
+    geom_smooth(aes(x = year, y = prob), span = .15, color = "blue") +
+    geom_hline(yintercept = 0.50, linetype = "dashed", color = "firebrick") +
+    theme(legend.position = c(1820, 0.4),
+          axis.text.x = element_text(size = 5),
+          axis.text.y = element_text(size = 5)) +
+    theme_classic()
+dev.copy2pdf(file = "figures/my_figure2.pdf", 
+            height = 5, width = 8)
+dev.off()
+
+
+## FIGURE 3 --------  
+jko809jjjjjk
+load("data/data_corpus_sotuparagraphs.rda")
+load("data/my_BT_best.rda")
+data_corpus_sotucompare <- data_corpus_sotuparagraphs %>%
+    corpus_reshape(to = "documents") %>%
+    corpus_subset(lubridate::year(Date) %in% c(1956, 1945, 1972, 1974, 1978:1980))
+predrd <- predict_readability(BT_best, newdata = data_corpus_sotucompare, 
+                              baseline_year = lubridate::year(docvars(data_corpus_sotucompare, "Date")), 
+                              bootstrap_n = 500)
+pred <- data.frame(predrd, 
+                   id = paste(docvars(data_corpus_sotucompare, "President"), 
+                              lubridate::year(docvars(data_corpus_sotucompare, "Date")), sep = "-"), 
+                   delivery = docvars(data_corpus_sotucompare, "delivery"),
+                   stringsAsFactors = FALSE)
+pred <- reshape(pred, timevar = "delivery", idvar = "id", direction = "wide")
+pred <- within(pred, {
+    PrSpokenEasier <- exp(lambda.spoken) / (exp(lambda.spoken) + exp(lambda.written))
+    PrSpokenEasier_lo <- exp(lambda_lo.spoken) / (exp(lambda_lo.spoken) + exp(lambda_lo.written))
+    PrSpokenEasier_hi <- exp(lambda_hi.spoken) / (exp(lambda_hi.spoken) + exp(lambda_hi.written))
+})
+
+# reorder factor levels for id
+pred$id <- factor(pred$id, levels = rev(pred$id))
+
+ggplot(pred, aes(x = id)) +
+    geom_point(aes(y = PrSpokenEasier)) +
+    scale_y_continuous(name = "Probability that Spoken SOTU was Easier than Written", 
+                       limits = c(.3, .7),
+                       breaks = seq(.3, .7, by = .1)) +
+    labs(x = "") + 
+    geom_hline(yintercept = .5, linetype = "dashed", color = "firebrick") +
+    geom_errorbar(aes(ymin = PrSpokenEasier_lo, 
+                      ymax = PrSpokenEasier_hi, x = id), width = 0) +
+    theme(axis.text.x = element_text(size = 10),
+          axis.text.y = element_text(size = 10)) +
+    theme_classic() + 
+    coord_flip()
+
+dev.copy2pdf(file = "figures/my_figure3.pdf", 
+             height = 3, width = 8)
+dev.off()
+```
+
+## Conclusion
+
+The original authors provided extensive guidance for this replication, ensuring a high fidelity reproduction of all steps. Any minor numerical discrepancies are likely due to variations in random number generation or slight differences in model fitting parameters.
+
+In reanalyzing the State of the Union (SOTU) addresses, several experiments were conducted, such as applying the new model to snippets and paragraphs, measuring textual complexity across different eras by considering changes in vocabulary rarity over time, and detecting subtle differences between different versions of the same address. These experiments demonstrate the new model’s flexibility, robustness, universality, and improved interpretability when introducing statistical properties to the measurement of textual sophistication.
