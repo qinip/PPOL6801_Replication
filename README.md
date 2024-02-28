@@ -18,7 +18,6 @@ This repository offers the replication materials for the study by Kenneth Benoit
 
 **Replication Materials**: The authors have generously provided all materials necessary for replicating the analyses presented in their article. These materials are hosted on the *American Journal of Political Science* Dataverse within the Harvard Dataverse Network. You can access the dataset directly via [DOI: 10.7910/DVN/9SF3TI](https://doi.org/10.7910/DVN/9SF3TI).
 
-The R codes used in the article can be found under the foder `code`.  The code used 
 
 ## Software Environment
 The original authors have provided guidance for installing the necessary components in the R environment for replication:
