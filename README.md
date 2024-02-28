@@ -6,7 +6,7 @@
 - [Deliverables](#Deliverables)
 - [Codes](#codes)
 - [Data](#data)
-- [Output](#output)
+- [Figures](#Figures)
 
 ## Introduction
 
